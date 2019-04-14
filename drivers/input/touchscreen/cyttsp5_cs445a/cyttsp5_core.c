@@ -26,6 +26,7 @@
 #include "cyttsp5_core.h"
 #include <linux/kthread.h>
 #include <linux/regulator/consumer.h>
+#include <linux/bitops.h>
 
 #define CY_CORE_STARTUP_RETRY_COUNT		3
 u8 tp_color_data = 0;
@@ -5387,11 +5388,9 @@ static ssize_t cyttsp5_easy_wakeup_gesture_show(struct device *dev,
 	return ret;
 }
 
-static ssize_t cyttsp5_easy_wakeup_gesture_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t size)
+static int cyttsp5_easy_wakeup_gesture_parse(struct cyttsp5_core_data *cd,
+		const char *buf, unsigned long *value)
 {
-	struct cyttsp5_core_data *cd = dev_get_drvdata(dev);
-	unsigned long value;
 	int ret;
 
 	if (!(cd->cpdata->flags & CY_CORE_FLAG_WAKE_ON_GESTURE)) {
@@ -5414,22 +5413,25 @@ static ssize_t cyttsp5_easy_wakeup_gesture_store(struct device *dev,
 		return -EINVAL;
 	}
 
-	ret = kstrtoul(buf, 10, &value);
+	ret = kstrtoul(buf, 10, value);
 	if (ret < 0) {
 		tp_log_err("%s %d:Parse input value fail, value: %s, ret:%d\n",
 					__func__, __LINE__, buf, ret);
 		return -EINVAL;
 	}
 
-	tp_log_info("%s %d:Input value: %lu\n", __func__, __LINE__, value);
-	if (value > 0xFFFF) {
-		tp_log_err("%s %d:Error value: %lu\n", __func__, __LINE__, value);
+	tp_log_info("%s %d:Input value: %lu\n", __func__, __LINE__, *value);
+	if (*value > 0xFFFF) {
+		tp_log_err("%s %d:Error value: %lu\n", __func__, __LINE__, *value);
 		return -EINVAL;
 	}
 
-	pm_runtime_get_sync(dev);
+	return 0;
+}
 
-	mutex_lock(&cd->system_lock);
+static int cyttsp5_easy_wakeup_gesture_set(struct cyttsp5_core_data *cd,
+		unsigned long value)
+{
 	if (cd->sysinfo.ready && IS_PIP_VER_GE(&cd->sysinfo, 1, 2)) {
 		cd->easy_wakeup_gesture = (unsigned int)value;
 	} else {
@@ -5437,8 +5439,28 @@ static ssize_t cyttsp5_easy_wakeup_gesture_store(struct device *dev,
 					cd->sysinfo.ready);
 		tp_log_err("%s %d:easy wakeup Error value: %d\n", __func__, __LINE__,
 					IS_PIP_VER_GE(&cd->sysinfo, 1, 2));
-		ret = -ENODEV;
+		return -ENODEV;
 	}
+
+	return 0;
+}
+
+static ssize_t cyttsp5_easy_wakeup_gesture_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t size)
+{
+	struct cyttsp5_core_data *cd = dev_get_drvdata(dev);
+	unsigned long value;
+	int ret;
+
+	ret = cyttsp5_easy_wakeup_gesture_parse(cd, buf, &value);
+	if (ret) {
+		return ret;
+	}
+
+	pm_runtime_get_sync(dev);
+
+	mutex_lock(&cd->system_lock);
+	ret = cyttsp5_easy_wakeup_gesture_set(cd, value);
 	mutex_unlock(&cd->system_lock);
 
 	pm_runtime_put(dev);
@@ -5489,6 +5511,54 @@ static ssize_t cyttsp5_easy_wakeup_position_show(struct device *dev,
 	mutex_unlock(&cd->system_lock);
 
 	return print_idx;
+}
+
+static ssize_t cyttsp5_tap_to_wake_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct cyttsp5_core_data *cd = dev_get_drvdata(dev);
+	int value;
+	ssize_t ret;
+
+	mutex_lock(&cd->system_lock);
+	value = cd->easy_wakeup_gesture & BIT_MASK(GESTURE_DOUBLE_CLICK);
+	mutex_unlock(&cd->system_lock);
+
+	ret = snprintf(buf, CY_MAX_PRBUF_SIZE, "0x%02X\n", value);
+	return ret;
+}
+
+static ssize_t cyttsp5_tap_to_wake_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t size)
+{
+	struct cyttsp5_core_data *cd = dev_get_drvdata(dev);
+	unsigned long value;
+	int ret;
+
+	ret = cyttsp5_easy_wakeup_gesture_parse(cd, buf, &value);
+	if (ret) {
+		return ret;
+	}
+
+	pm_runtime_get_sync(dev);
+
+	mutex_lock(&cd->system_lock);
+	if (value) {
+		value = cd->easy_wakeup_gesture | BIT_MASK(GESTURE_DOUBLE_CLICK);
+	}
+	else {
+		value = cd->easy_wakeup_gesture & ~BIT_MASK(GESTURE_DOUBLE_CLICK);
+	}
+	ret = cyttsp5_easy_wakeup_gesture_set(cd, value);
+	mutex_unlock(&cd->system_lock);
+
+	pm_runtime_put(dev);
+
+	if (ret) {
+		tp_log_err("%s %d:end with error NO.: %d\n", __func__, __LINE__, ret);
+		return ret;
+	}
+	return size;
 }
 
 /* Show Panel ID via sysfs */
@@ -5918,6 +5988,30 @@ static ssize_t hw_cyttsp5_easy_wakeup_supported_gestures_show(struct kobject *de
 	return cyttsp5_easy_wakeup_supported_gestures_show(cdev, NULL, buf);
 }
 
+static ssize_t hw_cyttsp5_tap_to_wake_show(struct kobject *dev,
+		struct kobj_attribute *attr, char *buf)
+{
+	struct device *cdev = cyttsp5_core_dev;
+	if (!cdev){
+		tp_log_err("%s: device is null", __func__);
+		return -EINVAL;
+	}
+
+	return cyttsp5_tap_to_wake_show(cdev, NULL, buf);
+}
+
+static ssize_t hw_cyttsp5_tap_to_wake_store(struct kobject *dev,
+		struct kobj_attribute *attr, const char *buf, size_t size)
+{
+	struct device *cdev = cyttsp5_core_dev;
+	if (!cdev){
+		tp_log_err("%s: device is null", __func__);
+		return -EINVAL;
+	}
+
+	return cyttsp5_tap_to_wake_store(cdev, NULL, buf, size);
+}
+
 static struct kobj_attribute easy_wakeup_gesture = {
 	.attr = {.name = "easy_wakeup_gesture", .mode = (S_IRUGO | S_IWUSR | S_IWGRP)},
 	.show = hw_cyttsp5_easy_wakeup_gesture_show,
@@ -5935,6 +6029,12 @@ static struct kobj_attribute easy_wakeup_position = {
 	.attr = {.name = "easy_wakeup_position", .mode = (S_IRUGO | S_IWUSR | S_IWGRP)},
 	.show = hw_cyttsp5_easy_wakeup_position_show,
 	.store = hw_cyttsp5_easy_wakeup_position_store,
+};
+
+static struct kobj_attribute tap_to_wake = {
+	.attr = {.name = "tap_to_wake", .mode = (S_IRUGO | S_IWUSR | S_IWGRP)},
+	.show = hw_cyttsp5_tap_to_wake_show,
+	.store = hw_cyttsp5_tap_to_wake_store,
 };
 
 static struct kobj_attribute glove_func = {
@@ -5988,6 +6088,15 @@ static int add_easy_wakeup_interfaces(struct device *dev)
 		{
 			kobject_put(properties_kobj);
 			tp_log_err("%s: easy_wakeup_position create file error\n", __func__);
+			return -ENODEV;
+		}
+
+		/*add the node tap_to_wake for apk to write*/
+		error = sysfs_create_file(properties_kobj, &tap_to_wake.attr);
+		if (error)
+		{
+			kobject_put(properties_kobj);
+			tp_log_err("%s: tap_to_wake create file error\n", __func__);
 			return -ENODEV;
 		}
 	}
